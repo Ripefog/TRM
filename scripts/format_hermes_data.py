@@ -84,7 +84,7 @@ def convert_hermes_to_swift(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     
     Hermes format (ShareGPT):
     {
-        "conversations": [
+        "conversations": [  # Can be a list or JSON string
             {"from": "system", "value": "..."},
             {"from": "user", "value": "..."},
             {"from": "assistant", "value": "<think>...</think>\n<tool_call>...</tool_call>"},
@@ -107,7 +107,16 @@ def convert_hermes_to_swift(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         ]
     }
     """
+    # Get conversations - can be list or JSON string
     conversations = sample.get('conversations', [])
+    
+    # If conversations is a string, parse it as JSON
+    if isinstance(conversations, str):
+        try:
+            conversations = json.loads(conversations)
+        except json.JSONDecodeError:
+            return None
+    
     if not conversations:
         return None
     
@@ -115,8 +124,9 @@ def convert_hermes_to_swift(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     messages = []
     
     for conv in conversations:
-        role = conv.get('from', '')
-        content = conv.get('value', '')
+        # Support both 'from'/'value' (ShareGPT) and 'role'/'content' (OpenAI) formats
+        role = conv.get('from') or conv.get('role', '')
+        content = conv.get('value') or conv.get('content', '')
         
         if role == 'system':
             # Extract tools from system prompt
@@ -173,6 +183,20 @@ def convert_hermes_to_swift(sample: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "content": content
             })
     
+    # Try to get tools from sample's 'tools' field if not found in system prompt
+    if not tools_str:
+        sample_tools = sample.get('tools')
+        if sample_tools:
+            if isinstance(sample_tools, str):
+                try:
+                    # Validate it's valid JSON
+                    tools = json.loads(sample_tools)
+                    tools_str = json.dumps(tools, ensure_ascii=False)
+                except json.JSONDecodeError:
+                    pass
+            elif isinstance(sample_tools, list):
+                tools_str = json.dumps(sample_tools, ensure_ascii=False)
+    
     # Validate: must have tools and at least user + assistant/tool_call
     if not tools_str:
         return None
@@ -221,9 +245,28 @@ def format_hermes_dataset(
     total_needed = train_size + val_size
     pbar = tqdm(total=total_needed, desc="Processing samples")
     
+    debug_shown = False
+    
     for i, sample in enumerate(ds):
         if len(train_data) >= train_size and len(val_data) >= val_size:
             break
+        
+        # Debug: show first sample structure
+        if not debug_shown:
+            print("\n=== DEBUG: First sample structure ===")
+            print(f"Keys: {list(sample.keys())}")
+            for key in sample.keys():
+                val = sample[key]
+                if isinstance(val, str):
+                    print(f"{key}: (str) {val[:200]}..." if len(val) > 200 else f"{key}: (str) {val}")
+                elif isinstance(val, list):
+                    print(f"{key}: (list) {len(val)} items")
+                    if val:
+                        print(f"  First item: {val[0]}")
+                else:
+                    print(f"{key}: ({type(val).__name__}) {val}")
+            print("=" * 50 + "\n")
+            debug_shown = True
             
         converted = convert_hermes_to_swift(sample)
         
