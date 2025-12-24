@@ -1,8 +1,0 @@
-*.parquet
-*.pdf
-__pycache__/
-*.pyc
-.ipynb_checkpoints/
-checkpoints/
-wandb/
-data/raw/
