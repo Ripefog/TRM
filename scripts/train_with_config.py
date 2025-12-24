@@ -17,7 +17,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from src.tokenizer import ToolCallTokenizer
 from src.dataset import ToolCallDataset
 from src.collator import ToolCallCollator
-from src.model import SimpleTRMToolCalling
+from src.models import create_model
 from configs.model_configs import get_config, estimate_parameters
 
 
@@ -173,13 +173,16 @@ def evaluate(model, dataloader, device):
 def main():
     parser = argparse.ArgumentParser(description='Train TRM for Tool Calling')
     
+    # Get project root
+    project_root = Path(__file__).parent.parent
+    
     # Model
     parser.add_argument('--model_size', type=str, default='small', choices=['tiny', 'small', 'base', 'large'],
                         help='Model size (tiny/small/base/large)')
     
     # Data
-    parser.add_argument('--train_data', type=str, default='data/xlam_1k_swift.json')
-    parser.add_argument('--eval_data', type=str, default='data/xlam_val_200_swift.json')
+    parser.add_argument('--train_data', type=str, default=str(project_root / 'data/xlam_1k_swift.json'))
+    parser.add_argument('--eval_data', type=str, default=str(project_root / 'data/xlam_val_200_swift.json'))
     
     # Tokenizer
     parser.add_argument('--tokenizer_path', type=str, default=None)
@@ -249,10 +252,10 @@ def main():
     
     # 4. Create model
     print("Creating model...")
-    model = SimpleTRMToolCalling(
+    model = create_model(
+        args.model_size,
         vocab_size=tokenizer.vocab_size(),
         num_tools=len(train_dataset.tool_to_id),
-        **model_config
     ).to(args.device)
     
     num_params = sum(p.numel() for p in model.parameters())
