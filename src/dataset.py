@@ -9,7 +9,7 @@ from torch.utils.data import Dataset
 class ToolCallDataset(Dataset):
     """Dataset for tool calling task"""
     
-    def __init__(self, data_path, tokenizer, max_len=512, max_args_len=128):
+    def __init__(self, data_path, tokenizer, max_len=512, max_args_len=128, tool_to_id=None):
         """
         Initialize dataset
         
@@ -18,6 +18,7 @@ class ToolCallDataset(Dataset):
             tokenizer: ToolCallTokenizer instance
             max_len: Maximum input sequence length
             max_args_len: Maximum arguments sequence length
+            tool_to_id: Optional pre-built tool vocabulary dict. If None, will build from data.
         """
         self.tokenizer = tokenizer
         self.max_len = max_len
@@ -28,10 +29,16 @@ class ToolCallDataset(Dataset):
         with open(data_path, 'r', encoding='utf-8') as f:
             self.data = json.load(f)
         
-        # Build tool vocabulary
-        self.tool_to_id = {}
-        self.id_to_tool = {}
-        self._build_tool_vocab()
+        # Build or use provided tool vocabulary
+        if tool_to_id is not None:
+            print(f"Using provided tool vocabulary ({len(tool_to_id)} tools)")
+            self.tool_to_id = tool_to_id
+            self.id_to_tool = {v: k for k, v in tool_to_id.items()}
+        else:
+            print("Building tool vocabulary from data...")
+            self.tool_to_id = {}
+            self.id_to_tool = {}
+            self._build_tool_vocab()
         
         print(f"Dataset loaded:")
         print(f"  - Samples: {len(self.data)}")

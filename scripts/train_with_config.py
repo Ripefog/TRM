@@ -235,13 +235,64 @@ def main():
         tokenizer.train(args.train_data, str(save_dir), vocab_size=args.vocab_size, model_type=args.model_type)
     print()
     
-    # 2. Create datasets
-    print("Creating datasets...")
-    train_dataset = ToolCallDataset(args.train_data, tokenizer, max_len=512, max_args_len=128)
-    eval_dataset = ToolCallDataset(args.eval_data, tokenizer, max_len=512, max_args_len=128)
+    # 2. Build shared tool vocabulary from both datasets
+    print("Building shared tool vocabulary...")
+    all_tools = set()
+    
+    # Collect tools from train data
+    print(f"  Scanning {args.train_data}...")
+    with open(args.train_data, 'r', encoding='utf-8') as f:
+        train_data = json.load(f)
+        for item in train_data:
+            tools_json = json.loads(item['tools'])
+            for tool in tools_json:
+                if 'type' in tool and tool['type'] == 'function':
+                    all_tools.add(tool['function']['name'])
+                else:
+                    all_tools.add(tool.get('name', 'unknown'))
+    
+    # Collect tools from eval data
+    print(f"  Scanning {args.eval_data}...")
+    with open(args.eval_data, 'r', encoding='utf-8') as f:
+        eval_data = json.load(f)
+        for item in eval_data:
+            tools_json = json.loads(item['tools'])
+            for tool in tools_json:
+                if 'type' in tool and tool['type'] == 'function':
+                    all_tools.add(tool['function']['name'])
+                else:
+                    all_tools.add(tool.get('name', 'unknown'))
+    
+    # Create shared mapping (sorted for consistency)
+    tool_to_id = {}
+    id_to_tool = {}
+    for idx, tool_name in enumerate(sorted(all_tools)):
+        tool_to_id[tool_name] = idx
+        id_to_tool[idx] = tool_name
+    
+    print(f"  ✓ Shared tool vocabulary: {len(tool_to_id)} unique tools")
+    print(f"  First 10 tools:")
+    for tool_name, tool_id in sorted(tool_to_id.items(), key=lambda x: x[1])[:10]:
+        print(f"    {tool_id}: {tool_name}")
+    if len(tool_to_id) > 10:
+        print(f"    ... and {len(tool_to_id) - 10} more")
     print()
     
-    # 3. Create dataloaders
+    # Save tool vocabulary
+    import pickle
+    tool_vocab_path = save_dir / 'tool_vocab.pkl'
+    with open(tool_vocab_path, 'wb') as f:
+        pickle.dump({'tool_to_id': tool_to_id, 'id_to_tool': id_to_tool}, f)
+    print(f"  ✓ Saved tool vocabulary to {tool_vocab_path}")
+    print()
+    
+    # 3. Create datasets with shared vocabulary
+    print("Creating datasets with shared vocabulary...")
+    train_dataset = ToolCallDataset(args.train_data, tokenizer, max_len=512, max_args_len=128, tool_to_id=tool_to_id)
+    eval_dataset = ToolCallDataset(args.eval_data, tokenizer, max_len=512, max_args_len=128, tool_to_id=tool_to_id)
+    print()
+    
+    # 4. Create dataloaders
     collator = ToolCallCollator(pad_token_id=tokenizer.pad_id())
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collator, num_workers=0)
     eval_loader = DataLoader(eval_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collator, num_workers=0)
@@ -250,7 +301,7 @@ def main():
     print(f"Eval batches: {len(eval_loader)}")
     print()
     
-    # 4. Create model
+    # 5. Create model
     print("Creating model...")
     model = create_model(
         args.model_size,
@@ -264,7 +315,7 @@ def main():
     print(f"Estimated: {params_est['total_M']:.1f}M")
     print()
     
-    # 5. Create optimizer and scheduler
+    # 6. Create optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     
     total_steps = len(train_loader) * args.num_epochs
@@ -278,7 +329,7 @@ def main():
     print(f"  Min LR: {args.learning_rate * args.min_lr_ratio:.2e}")
     print()
     
-    # 6. Training loop
+    # 7. Training loop
     print("=" * 80)
     print("Training")
     print("=" * 80)
