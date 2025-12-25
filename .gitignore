@@ -1,0 +1,77 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Model checkpoints and training outputs
+checkpoints/
+runs/
+logs/
+wandb/
+*.pt
+*.pth
+*.ckpt
+
+# Data files (large)
+data/*.json
+data/*.jsonl
+data/*.csv
+!data/README.md
+
+# Test/Reference repositories
+test_trm/
+anminhhung/
+
+# Research papers and documents
+*.pdf
+*.docx
+*.doc
+2510.04871v1.pdf
+2510.04871v1.docx
+
+# Tokenizer models (can be large)
+*.model
+*.vocab
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# Temporary files
+tmp/
+temp/
+*.tmp
