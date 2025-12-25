@@ -19,6 +19,7 @@ from src.dataset import ToolCallDataset
 from src.collator import ToolCallCollator
 from src.models import create_model
 from src.ema import EMAModel
+from src.metrics import compute_tool_metrics, compute_args_accuracy
 from configs.model_configs import get_config, estimate_parameters
 
 
@@ -52,8 +53,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None
     tool_loss_sum = 0
     q_loss_sum = 0
     args_loss_sum = 0
-    correct_tools = 0
-    total_samples = 0
+    
+    # For metrics
+    all_predictions = []
+    all_targets = []
     
     pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}")
     
@@ -96,7 +99,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None
                     target_args_ids.view(-1),
                     ignore_index=0,
                 )
-                loss += 2.0 * args_loss  # Weight: 2.0 (unchanged)
+                loss += 1.0 * args_loss  # Weight: 1.0 (reduced from 2.0)
                 batch_args_loss += args_loss.item()
         
         # Average over steps
@@ -119,30 +122,48 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None
         q_loss_sum += batch_q_loss / len(outputs_per_step)
         args_loss_sum += batch_args_loss / len(outputs_per_step) if batch_args_loss > 0 else 0
         
+        # Collect predictions for metrics
         with torch.no_grad():
             predicted = outputs_per_step[-1]['tool_logits'].argmax(dim=-1)
-            correct_tools += (predicted == target_tool_id).sum().item()
-            total_samples += target_tool_id.size(0)
+            all_predictions.extend(predicted.cpu().tolist())
+            all_targets.extend(target_tool_id.cpu().tolist())
         
         # Update progress bar
         current_lr = scheduler.get_last_lr()[0]
+        # Compute running accuracy
+        running_acc = sum(p == t for p, t in zip(all_predictions, all_targets)) / len(all_predictions) if all_predictions else 0.0
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
-            'acc': f'{correct_tools/total_samples:.4f}',
+            'acc': f'{running_acc:.4f}',
             'lr': f'{current_lr:.2e}'
         })
+    
+    # Compute comprehensive metrics
+    num_tools = len(dataloader.dataset.tool_to_id)
+    metrics = compute_tool_metrics(all_predictions, all_targets, num_tools)
     
     return {
         'loss': total_loss / len(dataloader),
         'tool_loss': tool_loss_sum / len(dataloader),
         'q_loss': q_loss_sum / len(dataloader),
         'args_loss': args_loss_sum / len(dataloader),
-        'accuracy': correct_tools / total_samples,
+        'accuracy': metrics['accuracy'],
+        'macro_f1': metrics['macro_f1'],
     }
 
 
-def evaluate(model, dataloader, device, ema=None):
-    """Evaluate model"""
+def evaluate(model, dataloader, device, ema=None, tokenizer=None, id_to_tool=None, print_samples=True):
+    """Evaluate model
+    
+    Args:
+        model: Model to evaluate
+        dataloader: Evaluation dataloader
+        device: Device to use
+        ema: Optional EMA model
+        tokenizer: Optional tokenizer for decoding args
+        id_to_tool: Optional dict mapping tool IDs to tool names
+        print_samples: Whether to print sample predictions
+    """
     model.eval()
     
     # Use EMA weights for evaluation if available
@@ -150,11 +171,20 @@ def evaluate(model, dataloader, device, ema=None):
         ema.apply_shadow()
     
     total_loss = 0
-    correct_tools = 0
-    total_samples = 0
+    
+    # For metrics
+    all_predictions = []
+    all_targets = []
+    all_args_logits = []
+    all_args_targets = []
+    
+    # For sample printing
+    samples_to_print = []
+    correct_sample_found = False
+    incorrect_sample_found = False
     
     with torch.no_grad():
-        for batch in tqdm(dataloader, desc="Evaluating"):
+        for batch_idx, batch in enumerate(tqdm(dataloader, desc="Evaluating")):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             target_tool_id = batch['target_tool_id'].to(device)
@@ -170,17 +200,99 @@ def evaluate(model, dataloader, device, ema=None):
             loss = loss / len(outputs_per_step)
             
             total_loss += loss.item()
+            
+            # Collect predictions for metrics
             predicted = outputs_per_step[-1]['tool_logits'].argmax(dim=-1)
-            correct_tools += (predicted == target_tool_id).sum().item()
-            total_samples += target_tool_id.size(0)
+            all_predictions.extend(predicted.cpu().tolist())
+            all_targets.extend(target_tool_id.cpu().tolist())
+            
+            # Collect args for metrics (if available)
+            if 'args_logits' in outputs_per_step[-1]:
+                all_args_logits.append(outputs_per_step[-1]['args_logits'].cpu())
+                all_args_targets.append(target_args_ids.cpu())
+            
+            # Collect samples for printing (first batch only)
+            if print_samples and batch_idx == 0 and len(samples_to_print) < 2:
+                for i in range(min(2, predicted.size(0))):
+                    pred_tool = predicted[i].item()
+                    target_tool = target_tool_id[i].item()
+                    is_correct = (pred_tool == target_tool)
+                    
+                    # Collect one correct and one incorrect sample
+                    if (is_correct and not correct_sample_found) or (not is_correct and not incorrect_sample_found):
+                        sample = {
+                            'predicted_tool_id': pred_tool,
+                            'target_tool_id': target_tool,
+                            'is_correct': is_correct,
+                            'num_steps': len(outputs_per_step),
+                        }
+                        
+                        # Add tool names if available
+                        if id_to_tool:
+                            sample['predicted_tool_name'] = id_to_tool.get(pred_tool, f'unknown_{pred_tool}')
+                            sample['target_tool_name'] = id_to_tool.get(target_tool, f'unknown_{target_tool}')
+                        
+                        # Add args if available
+                        if 'args_logits' in outputs_per_step[-1] and tokenizer:
+                            pred_args = outputs_per_step[-1]['args_logits'][i].argmax(dim=-1)
+                            target_args = target_args_ids[i]
+                            
+                            # Decode args (remove padding)
+                            pred_args_list = pred_args[pred_args != 0].cpu().tolist()
+                            target_args_list = target_args[target_args != 0].cpu().tolist()
+                            
+                            sample['predicted_args'] = tokenizer.decode(pred_args_list) if pred_args_list else ""
+                            sample['target_args'] = tokenizer.decode(target_args_list) if target_args_list else ""
+                        
+                        samples_to_print.append(sample)
+                        
+                        if is_correct:
+                            correct_sample_found = True
+                        else:
+                            incorrect_sample_found = True
     
     # Restore original weights if using EMA
     if ema is not None:
         ema.restore()
     
+    # Compute comprehensive metrics
+    num_tools = len(dataloader.dataset.tool_to_id)
+    tool_metrics = compute_tool_metrics(all_predictions, all_targets, num_tools)
+    
+    # Compute args metrics if available
+    args_metrics = {}
+    if all_args_logits:
+        args_logits_cat = torch.cat(all_args_logits, dim=0)
+        args_targets_cat = torch.cat(all_args_targets, dim=0)
+        args_metrics = compute_args_accuracy(args_logits_cat, args_targets_cat, pad_token_id=0)
+    
+    # Print samples
+    if print_samples and samples_to_print:
+        print("\n" + "="*80)
+        print("SAMPLE PREDICTIONS:")
+        print("="*80)
+        for idx, sample in enumerate(samples_to_print, 1):
+            status = "✓ CORRECT" if sample['is_correct'] else "✗ INCORRECT"
+            print(f"\nSample {idx}: {status}")
+            print(f"  Steps: {sample['num_steps']}")
+            
+            if 'predicted_tool_name' in sample:
+                print(f"  Predicted Tool: {sample['predicted_tool_name']} (ID: {sample['predicted_tool_id']})")
+                print(f"  Target Tool:    {sample['target_tool_name']} (ID: {sample['target_tool_id']})")
+            else:
+                print(f"  Predicted Tool ID: {sample['predicted_tool_id']}")
+                print(f"  Target Tool ID:    {sample['target_tool_id']}")
+            
+            if 'predicted_args' in sample:
+                print(f"  Predicted Args: {sample['predicted_args'][:100]}...")
+                print(f"  Target Args:    {sample['target_args'][:100]}...")
+        print("="*80 + "\n")
+    
     return {
         'loss': total_loss / len(dataloader),
-        'accuracy': correct_tools / total_samples,
+        'accuracy': tool_metrics['accuracy'],
+        'macro_f1': tool_metrics['macro_f1'],
+        **args_metrics,
     }
 
 
@@ -361,23 +473,35 @@ def main():
     print("=" * 80)
     
     best_eval_acc = 0.0
+    best_eval_f1 = 0.0
     
     for epoch in range(args.num_epochs):
         # Train
         train_metrics = train_epoch(model, train_loader, optimizer, scheduler, args.device, epoch, ema)
         
         print(f"\nEpoch {epoch+1}/{args.num_epochs}")
-        print(f"  Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
+        print(f"  Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}, F1: {train_metrics['macro_f1']:.4f}")
         print(f"    Tool Loss: {train_metrics['tool_loss']:.4f}, Q Loss: {train_metrics['q_loss']:.4f}, "
               f"Args Loss: {train_metrics['args_loss']:.4f}")
         
         # Evaluate
         if (epoch + 1) % args.eval_every == 0:
-            eval_metrics = evaluate(model, eval_loader, args.device, ema)
-            print(f"  Eval Loss: {eval_metrics['loss']:.4f}, Acc: {eval_metrics['accuracy']:.4f}")
+            eval_metrics = evaluate(
+                model, eval_loader, args.device, ema,
+                tokenizer=tokenizer,
+                id_to_tool=train_dataset.id_to_tool,
+                print_samples=True
+            )
+            print(f"  Eval Loss: {eval_metrics['loss']:.4f}, Acc: {eval_metrics['accuracy']:.4f}, F1: {eval_metrics['macro_f1']:.4f}")
             
-            # Save best model
-            if eval_metrics['accuracy'] > best_eval_acc:
+            # Print args metrics if available
+            if 'args_token_accuracy' in eval_metrics:
+                print(f"    Args Token Acc: {eval_metrics['args_token_accuracy']:.4f}, "
+                      f"Args Seq Acc: {eval_metrics['args_sequence_accuracy']:.4f}")
+            
+            # Save best model (based on F1 score for imbalanced data)
+            if eval_metrics['macro_f1'] > best_eval_f1:
+                best_eval_f1 = eval_metrics['macro_f1']
                 best_eval_acc = eval_metrics['accuracy']
                 checkpoint = {
                     'epoch': epoch,
