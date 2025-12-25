@@ -132,8 +132,17 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None
         current_lr = scheduler.get_last_lr()[0]
         # Compute running accuracy
         running_acc = sum(p == t for p, t in zip(all_predictions, all_targets)) / len(all_predictions) if all_predictions else 0.0
+        
+        # Compute average component losses for display
+        avg_tool_loss = batch_tool_loss / len(outputs_per_step)
+        avg_q_loss = batch_q_loss / len(outputs_per_step)
+        avg_args_loss = batch_args_loss / len(outputs_per_step) if batch_args_loss > 0 else 0.0
+        
         pbar.set_postfix({
             'loss': f'{loss.item():.4f}',
+            'tool': f'{avg_tool_loss:.2f}',
+            'q': f'{avg_q_loss:.2f}',
+            'args': f'{avg_args_loss:.2f}',
             'acc': f'{running_acc:.4f}',
             'lr': f'{current_lr:.2e}'
         })
@@ -260,11 +269,22 @@ def evaluate(model, dataloader, device, ema=None, tokenizer=None, id_to_tool=Non
     tool_metrics = compute_tool_metrics(all_predictions, all_targets, num_tools)
     
     # Compute args metrics if available
+    # Note: Can't concatenate tensors with different seq_len, so compute per-batch and average
     args_metrics = {}
     if all_args_logits:
-        args_logits_cat = torch.cat(all_args_logits, dim=0)
-        args_targets_cat = torch.cat(all_args_targets, dim=0)
-        args_metrics = compute_args_accuracy(args_logits_cat, args_targets_cat, pad_token_id=0)
+        total_token_acc = 0.0
+        total_seq_acc = 0.0
+        num_batches = len(all_args_logits)
+        
+        for args_logits, args_targets in zip(all_args_logits, all_args_targets):
+            batch_metrics = compute_args_accuracy(args_logits, args_targets, pad_token_id=0)
+            total_token_acc += batch_metrics['args_token_accuracy']
+            total_seq_acc += batch_metrics['args_sequence_accuracy']
+        
+        args_metrics = {
+            'args_token_accuracy': total_token_acc / num_batches,
+            'args_sequence_accuracy': total_seq_acc / num_batches,
+        }
     
     # Print samples
     if print_samples and samples_to_print:
