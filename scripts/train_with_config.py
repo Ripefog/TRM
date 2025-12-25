@@ -74,21 +74,21 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None
         batch_args_loss = 0
         
         for step, outputs in enumerate(outputs_per_step):
-            # Tool selection loss
+            # Tool selection loss (matches test_trm action_loss_weight)
             tool_logits = outputs['tool_logits']
             tool_loss = nn.functional.cross_entropy(tool_logits, target_tool_id)
-            loss += tool_loss
+            loss += 2.0 * tool_loss  # Weight: 2.0 (increased from 1.0)
             batch_tool_loss += tool_loss.item()
             
-            # Q loss (correctness prediction)
+            # Q loss (correctness prediction, matches test_trm q_loss_weight)
             q_logit = outputs['q_logit'].squeeze()
             predicted_tool = tool_logits.argmax(dim=-1)
             is_correct = (predicted_tool == target_tool_id).float()
             q_loss = nn.functional.binary_cross_entropy_with_logits(q_logit, is_correct)
-            loss += 0.5 * q_loss
+            loss += 0.5 * q_loss  # Weight: 0.5 (unchanged)
             batch_q_loss += q_loss.item()
             
-            # Arguments generation loss (last step only)
+            # Arguments generation loss (matches test_trm tool_call_gen_weight)
             if 'args_logits' in outputs:
                 args_logits = outputs['args_logits']
                 args_loss = nn.functional.cross_entropy(
@@ -96,7 +96,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None
                     target_args_ids.view(-1),
                     ignore_index=0,
                 )
-                loss += 2.0 * args_loss
+                loss += 2.0 * args_loss  # Weight: 2.0 (unchanged)
                 batch_args_loss += args_loss.item()
         
         # Average over steps
