@@ -18,6 +18,7 @@ from src.tokenizer import ToolCallTokenizer
 from src.dataset import ToolCallDataset
 from src.collator import ToolCallCollator
 from src.models import create_model
+from src.ema import EMAModel
 from configs.model_configs import get_config, estimate_parameters
 
 
@@ -44,7 +45,7 @@ def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda)
 
 
-def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
+def train_epoch(model, dataloader, optimizer, scheduler, device, epoch, ema=None):
     """Train for one epoch"""
     model.train()
     total_loss = 0
@@ -64,7 +65,7 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
         target_args_ids = batch['target_args_ids'].to(device)
         
         # Forward
-        outputs_per_step = model(input_ids, attention_mask, target_args_ids)
+        outputs_per_step = model(input_ids, attention_mask, target_args_ids, training=True)
         
         # Compute loss
         loss = 0
@@ -108,6 +109,10 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
         optimizer.step()
         scheduler.step()
         
+        # Update EMA
+        if ema is not None:
+            ema.update()
+        
         # Stats
         total_loss += loss.item()
         tool_loss_sum += batch_tool_loss / len(outputs_per_step)
@@ -136,9 +141,14 @@ def train_epoch(model, dataloader, optimizer, scheduler, device, epoch):
     }
 
 
-def evaluate(model, dataloader, device):
+def evaluate(model, dataloader, device, ema=None):
     """Evaluate model"""
     model.eval()
+    
+    # Use EMA weights for evaluation if available
+    if ema is not None:
+        ema.apply_shadow()
+    
     total_loss = 0
     correct_tools = 0
     total_samples = 0
@@ -150,7 +160,7 @@ def evaluate(model, dataloader, device):
             target_tool_id = batch['target_tool_id'].to(device)
             target_args_ids = batch['target_args_ids'].to(device)
             
-            outputs_per_step = model(input_ids, attention_mask, target_args_ids)
+            outputs_per_step = model(input_ids, attention_mask, target_args_ids, training=False)
             
             # Compute loss (simplified)
             loss = 0
@@ -163,6 +173,10 @@ def evaluate(model, dataloader, device):
             predicted = outputs_per_step[-1]['tool_logits'].argmax(dim=-1)
             correct_tools += (predicted == target_tool_id).sum().item()
             total_samples += target_tool_id.size(0)
+    
+    # Restore original weights if using EMA
+    if ema is not None:
+        ema.restore()
     
     return {
         'loss': total_loss / len(dataloader),
@@ -201,6 +215,10 @@ def main():
     parser.add_argument('--save_dir', type=str, default='checkpoints')
     parser.add_argument('--eval_every', type=int, default=5)
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # EMA
+    parser.add_argument('--use_ema', action='store_true', help='Use Exponential Moving Average')
+    parser.add_argument('--ema_decay', type=float, default=0.9999, help='EMA decay rate')
     
     args = parser.parse_args()
     
@@ -329,6 +347,14 @@ def main():
     print(f"  Min LR: {args.learning_rate * args.min_lr_ratio:.2e}")
     print()
     
+    # 8. Initialize EMA
+    ema = None
+    if args.use_ema:
+        ema = EMAModel(model, decay=args.ema_decay, device=args.device)
+        print(f"EMA initialized with decay={args.ema_decay}")
+        print("  Note: EMA stabilizes recursive reasoning depth")
+        print()
+    
     # 7. Training loop
     print("=" * 80)
     print("Training")
@@ -338,7 +364,7 @@ def main():
     
     for epoch in range(args.num_epochs):
         # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, args.device, epoch)
+        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, args.device, epoch, ema)
         
         print(f"\nEpoch {epoch+1}/{args.num_epochs}")
         print(f"  Train Loss: {train_metrics['loss']:.4f}, Acc: {train_metrics['accuracy']:.4f}")
@@ -347,13 +373,13 @@ def main():
         
         # Evaluate
         if (epoch + 1) % args.eval_every == 0:
-            eval_metrics = evaluate(model, eval_loader, args.device)
+            eval_metrics = evaluate(model, eval_loader, args.device, ema)
             print(f"  Eval Loss: {eval_metrics['loss']:.4f}, Acc: {eval_metrics['accuracy']:.4f}")
             
             # Save best model
             if eval_metrics['accuracy'] > best_eval_acc:
                 best_eval_acc = eval_metrics['accuracy']
-                torch.save({
+                checkpoint = {
                     'epoch': epoch,
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -362,19 +388,25 @@ def main():
                     'eval_metrics': eval_metrics,
                     'tool_to_id': train_dataset.tool_to_id,
                     'model_config': model_config,
-                }, save_dir / 'best_model.pt')
+                }
+                if ema is not None:
+                    checkpoint['ema_state_dict'] = ema.state_dict()
+                torch.save(checkpoint, save_dir / 'best_model.pt')
                 print(f"  ✓ Saved best model (acc: {eval_metrics['accuracy']:.4f})")
         
         # Save checkpoint
         if (epoch + 1) % 10 == 0:
-            torch.save({
+            checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'tool_to_id': train_dataset.tool_to_id,
                 'model_config': model_config,
-            }, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
+            }
+            if ema is not None:
+                checkpoint['ema_state_dict'] = ema.state_dict()
+            torch.save(checkpoint, save_dir / f'checkpoint_epoch_{epoch+1}.pt')
         
         print()
     

@@ -35,7 +35,7 @@ def train_epoch(model, dataloader, optimizer, device, epoch):
         target_args_ids = batch['target_args_ids'].to(device)
         
         # Forward
-        outputs_per_step = model(input_ids, attention_mask, target_args_ids)
+        outputs_per_step = model(input_ids, attention_mask, target_args_ids, training=True)
         
         # Compute loss (simplified)
         loss = 0

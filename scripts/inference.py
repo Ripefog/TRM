@@ -6,39 +6,77 @@ import json
 import argparse
 from pathlib import Path
 import sys
+import pickle
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from src.tokenizer import ToolCallTokenizer
-from src.model import SimpleTRMToolCalling
+from src.models import create_model
 
 
-def load_model(model_path, tokenizer_path, device='cuda'):
-    """Load trained model and tokenizer"""
-    print(f"Loading model from {model_path}...")
+def load_model(checkpoint_dir, device='cuda'):
+    """Load trained model and tokenizer
+    
+    Args:
+        checkpoint_dir: Directory containing checkpoint files
+        device: Device to load model on
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    print(f"Loading model from {checkpoint_dir}...")
     
     # Load checkpoint
+    model_path = checkpoint_dir / 'best_model.pt'
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model checkpoint not found: {model_path}")
+    
     checkpoint = torch.load(model_path, map_location=device)
     
     # Load tokenizer
-    tokenizer = ToolCallTokenizer(tokenizer_path)
+    tokenizer_path = checkpoint_dir / 'sp_tokenizer.model'
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
     
-    # Create model
+    tokenizer = ToolCallTokenizer(str(tokenizer_path))
+    
+    # Load tool vocabulary
+    tool_vocab_path = checkpoint_dir / 'tool_vocab.pkl'
+    if tool_vocab_path.exists():
+        print(f"Loading tool vocabulary from {tool_vocab_path}...")
+        with open(tool_vocab_path, 'rb') as f:
+            vocab = pickle.load(f)
+            tool_to_id = vocab['tool_to_id']
+            id_to_tool = vocab['id_to_tool']
+    else:
+        # Fallback to checkpoint (old format)
+        print("Warning: tool_vocab.pkl not found, using checkpoint tool vocab")
+        tool_to_id = checkpoint['tool_to_id']
+        id_to_tool = {v: k for k, v in tool_to_id.items()}
+    
+    # Get model config and size
     model_config = checkpoint['model_config']
-    tool_to_id = checkpoint['tool_to_id']
-    id_to_tool = {v: k for k, v in tool_to_id.items()}
     
-    model = SimpleTRMToolCalling(
+    # Determine model size from config
+    if model_config['hidden_dim'] == 128:
+        model_size = 'tiny'
+    elif model_config['hidden_dim'] == 512:
+        model_size = 'small'
+    elif model_config['hidden_dim'] == 768:
+        model_size = 'base'
+    else:
+        model_size = 'large'
+    
+    # Create model using factory
+    model = create_model(
+        model_size,
         vocab_size=tokenizer.vocab_size(),
         num_tools=len(tool_to_id),
-        **model_config
     ).to(device)
     
     # Load weights
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     
-    print(f"✓ Model loaded ({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
+    print(f"✓ Model loaded: {model_size} ({sum(p.numel() for p in model.parameters())/1e6:.1f}M params)")
     print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size()})")
     print(f"✓ Tool vocabulary: {len(tool_to_id)} tools")
     
@@ -47,14 +85,31 @@ def load_model(model_path, tokenizer_path, device='cuda'):
 
 def format_input(tools_json, user_query):
     """Format input for model"""
+    # Handle empty or None tools
+    if not tools_json or tools_json.strip() == '':
+        raise ValueError("Tools cannot be empty. Provide tools as JSON or comma-separated names.")
+    
     # Parse tools
-    tools = json.loads(tools_json) if isinstance(tools_json, str) else tools_json
+    try:
+        tools = json.loads(tools_json) if isinstance(tools_json, str) else tools_json
+    except json.JSONDecodeError:
+        # Try parsing as comma-separated tool names
+        if ',' in tools_json or ('{' not in tools_json and '[' not in tools_json):
+            tool_names = [t.strip() for t in tools_json.split(',')]
+            tools = [{"name": name} for name in tool_names if name]
+        else:
+            raise ValueError(f"Invalid tools format. Expected JSON or comma-separated names, got: {tools_json[:100]}")
+    
+    # Extract tool names
     tool_names = []
     for tool in tools:
         if 'type' in tool and tool['type'] == 'function':
             tool_names.append(tool['function']['name'])
         else:
             tool_names.append(tool.get('name', 'unknown'))
+    
+    if not tool_names:
+        raise ValueError("No valid tools found in input")
     
     # Format
     input_text = f"Tools: {', '.join(tool_names)}\n"
@@ -74,7 +129,7 @@ def predict(model, tokenizer, tool_to_id, id_to_tool, tools_json, user_query, de
     
     # Forward pass
     with torch.no_grad():
-        outputs_per_step = model(input_ids, attention_mask=None, target_args_ids=None)
+        outputs_per_step = model(input_ids, attention_mask=None, target_args_ids=None, training=False)
     
     # Get final predictions
     final_outputs = outputs_per_step[-1]
@@ -137,8 +192,8 @@ def predict(model, tokenizer, tool_to_id, id_to_tool, tools_json, user_query, de
 
 def main():
     parser = argparse.ArgumentParser(description='TRM Tool Calling Inference')
-    parser.add_argument('--model_path', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--tokenizer_path', type=str, required=True, help='Path to tokenizer model')
+    parser.add_argument('--checkpoint_dir', type=str, required=True, 
+                       help='Path to checkpoint directory (e.g., checkpoints/small)')
     parser.add_argument('--tools', type=str, help='Tools JSON string or path to JSON file')
     parser.add_argument('--query', type=str, help='User query')
     parser.add_argument('--interactive', action='store_true', help='Interactive mode')
@@ -147,7 +202,7 @@ def main():
     args = parser.parse_args()
     
     # Load model
-    model, tokenizer, tool_to_id, id_to_tool = load_model(args.model_path, args.tokenizer_path, args.device)
+    model, tokenizer, tool_to_id, id_to_tool = load_model(args.checkpoint_dir, args.device)
     
     print("\n" + "=" * 80)
     print("TRM Tool Calling - Inference")
@@ -192,22 +247,41 @@ def main():
     else:
         # Single prediction mode
         if not args.tools or not args.query:
-            print("Error: --tools and --query required in non-interactive mode")
+            print("\n" + "=" * 80)
+            print("ERROR: Missing required arguments")
+            print("=" * 80)
+            print("\nFor single prediction mode, you must provide:")
+            print("  --tools: Tools as JSON or comma-separated names")
+            print("  --query: User query")
+            print("\nExamples:")
+            print("  # JSON format:")
+            print('  --tools \'[{"type":"function","function":{"name":"get_weather"}}]\'')
+            print('  --query "What is the weather?"')
+            print("\n  # Simple format:")
+            print('  --tools "get_weather, search_web"')
+            print('  --query "What is the weather?"')
+            print("\n  # Interactive mode (easier):")
+            print('  --interactive')
+            print("=" * 80)
             return
         
         # Load tools
-        if Path(args.tools).exists():
-            with open(args.tools, 'r') as f:
-                tools_json = f.read()
-        else:
-            tools_json = args.tools
-        
-        # Predict
-        result = predict(model, tokenizer, tool_to_id, id_to_tool, tools_json, args.query, args.device)
-        
-        # Print result
-        print("\nPrediction:")
-        print(json.dumps(result, indent=2))
+        try:
+            if Path(args.tools).exists():
+                with open(args.tools, 'r') as f:
+                    tools_json = f.read()
+            else:
+                tools_json = args.tools
+            
+            # Predict
+            result = predict(model, tokenizer, tool_to_id, id_to_tool, tools_json, args.query, args.device)
+            
+            # Print result
+            print("\nPrediction:")
+            print(json.dumps(result, indent=2))
+        except Exception as e:
+            print(f"\n❌ Error during prediction: {e}")
+            print("\nTip: Use --interactive mode for easier testing")
 
 
 if __name__ == '__main__':

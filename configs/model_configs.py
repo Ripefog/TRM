@@ -16,6 +16,8 @@ CONFIGS = {
         'num_recursions': 2,
         'max_supervision_steps': 2,
         'deep_recursion_steps': 1,  # No deep recursion for tiny
+        'use_original_trm_grad': False,  # Standard gradient flow
+        'q_threshold': 0.8,  # ACT early stopping threshold
         'dropout': 0.1,
         'use_swiglu': False,  # Standard FFN for tiny
         'use_rmsnorm': False,  # LayerNorm for tiny
@@ -31,6 +33,8 @@ CONFIGS = {
         'num_recursions': 3,
         'max_supervision_steps': 6,
         'deep_recursion_steps': 3,  # T=3 (2 no-grad + 1 with-grad)
+        'use_original_trm_grad': True,  # Use original TRM gradient flow
+        'q_threshold': 0.8,  # ACT early stopping threshold
         'dropout': 0.1,
         'use_swiglu': True,  # Use SwiGLU
         'use_rmsnorm': True,  # Use RMSNorm
@@ -46,6 +50,8 @@ CONFIGS = {
         'num_recursions': 3,
         'max_supervision_steps': 8,
         'deep_recursion_steps': 3,  # T=3
+        'use_original_trm_grad': True,  # Use original TRM gradient flow
+        'q_threshold': 0.8,  # ACT early stopping threshold
         'dropout': 0.1,
         'use_swiglu': True,
         'use_rmsnorm': True,
@@ -61,6 +67,8 @@ CONFIGS = {
         'num_recursions': 3,
         'max_supervision_steps': 8,
         'deep_recursion_steps': 3,  # T=3
+        'use_original_trm_grad': True,  # Use original TRM gradient flow
+        'q_threshold': 0.8,  # ACT early stopping threshold
         'dropout': 0.1,
         'use_swiglu': True,
         'use_rmsnorm': True,

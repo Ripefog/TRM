@@ -31,6 +31,8 @@ class TRMToolCalling(nn.Module):
         num_recursions=3,
         max_supervision_steps=6,
         deep_recursion_steps=1,
+        use_original_trm_grad=False,
+        q_threshold=0.8,
         dropout=0.1,
         use_swiglu=True,
         use_rmsnorm=True,
@@ -44,6 +46,8 @@ class TRMToolCalling(nn.Module):
         self.deep_recursion_steps = deep_recursion_steps
         self.use_swiglu = use_swiglu
         self.use_rmsnorm = use_rmsnorm
+        self.use_original_trm_grad = use_original_trm_grad
+        self.q_threshold = q_threshold
         
         # Embeddings
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
@@ -78,6 +82,65 @@ class TRMToolCalling(nn.Module):
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
     
+    def _latent_recursion(self, x_encoded, y, z, n_recursions):
+        """Single latent recursion: refine z n times, then update y
+        
+        This is the inner loop from TRM paper:
+            for i in range(n):
+                z = net(x, y, z)
+            y = net(y, z)
+        
+        Args:
+            x_encoded: (batch_size, seq_len, hidden_dim) - encoded input
+            y: (batch_size, action_dim) - current action state
+            z: (batch_size, reasoning_dim) or None - current reasoning state
+            n_recursions: number of reasoning refinement iterations
+        
+        Returns:
+            y: updated action state
+            z: updated reasoning state
+        """
+        z = self.reasoning_module(x_encoded, y, z, n_recursions)
+        y = self.action_module(y, z)
+        return y, z
+    
+    def _deep_recursion(self, x_encoded, y, z, n_recursions, T, use_original_grad=False):
+        """Deep recursion with T iterations of latent_recursion
+        
+        Original TRM paper gradient flow:
+            - T-1 iterations WITHOUT gradients (torch.no_grad)
+            - 1 iteration WITH gradients
+            - Returns detached y, z
+        
+        Args:
+            x_encoded: encoded input
+            y: current action state
+            z: current reasoning state
+            n_recursions: n parameter (latent reasoning iterations)
+            T: T parameter (deep recursion iterations)
+            use_original_grad: if True, use original TRM gradient flow
+        
+        Returns:
+            y: updated action state (detached if use_original_grad)
+            z: updated reasoning state (detached if use_original_grad)
+        """
+        if use_original_grad and T > 1:
+            # Original TRM: T-1 iterations without gradients
+            with torch.no_grad():
+                for j in range(T - 1):
+                    y, z = self._latent_recursion(x_encoded, y, z, n_recursions)
+            
+            # Final iteration with gradients
+            y, z = self._latent_recursion(x_encoded, y, z, n_recursions)
+            
+            # Detach before returning (original TRM behavior)
+            return y.detach(), z.detach()
+        else:
+            # Standard: all T iterations with gradients
+            for j in range(T):
+                y, z = self._latent_recursion(x_encoded, y, z, n_recursions)
+            return y, z
+    
     def encode(self, input_ids, attention_mask=None):
         """Encode input sequence"""
         batch_size, seq_len = input_ids.shape
@@ -100,14 +163,15 @@ class TRMToolCalling(nn.Module):
         
         return x_encoded
     
-    def forward(self, input_ids, attention_mask=None, target_args_ids=None):
+    def forward(self, input_ids, attention_mask=None, target_args_ids=None, training=True):
         """
-        Forward pass with optional Deep Recursion
+        Forward pass with Deep Recursion and ACT (Adaptive Computation Time)
         
         Args:
             input_ids: (batch_size, seq_len)
             attention_mask: (batch_size, seq_len)
             target_args_ids: (batch_size, args_len) - for teacher forcing
+            training: bool - if False, enables ACT early stopping
         
         Returns:
             outputs_per_step: List of dicts, one per supervision step
@@ -124,29 +188,21 @@ class TRMToolCalling(nn.Module):
         # Deep supervision loop
         outputs_per_step = []
         
+        # Get TRM parameters
+        T = self.deep_recursion_steps
+        use_original_grad = self.use_original_trm_grad
+        n_recursions = self.num_recursions
+        
         for step in range(self.max_supervision_steps):
-            # Deep Recursion (T iterations)
-            for t in range(self.deep_recursion_steps):
-                # No gradients for first T-1 iterations
-                if self.deep_recursion_steps > 1:
-                    context = torch.no_grad() if t < self.deep_recursion_steps - 1 else nullcontext()
-                else:
-                    context = nullcontext()
-                
-                with context:
-                    # Recursive reasoning
-                    z_new = self.reasoning_module(x_encoded, y, z, self.num_recursions)
-                    
-                    # Update action
-                    y_new = self.action_module(y, z_new)
-                    
-                    # Update states for next iteration
-                    if t < self.deep_recursion_steps - 1:
-                        z = z_new.detach()
-                        y = y_new.detach()
-                    else:
-                        z = z_new
-                        y = y_new
+            # Deep recursion: T iterations of latent_recursion
+            y, z = self._deep_recursion(
+                x_encoded=x_encoded,
+                y=y,
+                z=z,
+                n_recursions=n_recursions,
+                T=T,
+                use_original_grad=use_original_grad
+            )
             
             # Output heads (after T iterations)
             is_last_step = (step == self.max_supervision_steps - 1)
@@ -158,12 +214,30 @@ class TRMToolCalling(nn.Module):
             
             outputs_per_step.append(outputs)
             
-            # Detach for next supervision step
-            y = y.detach()
-            if z is not None:
-                z = z.detach()
+            # ACT: Check for early stopping (inference only)
+            if not training:
+                q_prob = torch.sigmoid(outputs['q_logit']).mean().item()
+                if q_prob > self.q_threshold:
+                    # Generate on early stop (if not already generated)
+                    if target_args_ids is not None and 'args_logits' not in outputs:
+                        # Re-run output heads with generation enabled
+                        outputs = self.output_heads(
+                            y,
+                            token_embedding=self.token_embedding,
+                            target_args_ids=target_args_ids
+                        )
+                        # Update the last output in list
+                        outputs_per_step[-1] = outputs
+                    break
+            
+            # Detach for next supervision step (if not already detached by use_original_grad)
+            if not use_original_grad:
+                y = y.detach()
+                if z is not None:
+                    z = z.detach()
         
         return outputs_per_step
+
     
     def get_config(self):
         """Get model configuration"""
